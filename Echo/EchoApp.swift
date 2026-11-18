@@ -6,6 +6,7 @@ struct EchoApp: App {
     @StateObject private var library: Library
     @StateObject private var player: PlayerController
     @StateObject private var radio = RadioStore()
+    @StateObject private var online = OnlineStore.shared
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
@@ -13,7 +14,7 @@ struct EchoApp: App {
         let l = Library()
         _settings = StateObject(wrappedValue: s)
         _library = StateObject(wrappedValue: l)
-        _player = StateObject(wrappedValue: PlayerController(library: l, settings: s))
+        _player = StateObject(wrappedValue: PlayerController(library: l, settings: s, online: OnlineStore.shared))
     }
 
     var body: some Scene {
@@ -23,6 +24,7 @@ struct EchoApp: App {
                 .environmentObject(library)
                 .environmentObject(player)
                 .environmentObject(radio)
+                .environmentObject(online)
                 .preferredColorScheme(.dark)
                 .tint(settings.accent.color)
                 .onOpenURL { url in

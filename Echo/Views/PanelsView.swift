@@ -144,7 +144,7 @@ struct QueueView: View {
                         Text("Дальше ничего нет").foregroundStyle(.secondary)
                     }
                     ForEach(Array(up.enumerated()), id: \.offset) { offset, id in
-                        if let t = library.track(id) {
+                        if let t = library.resolve(id) {
                             Button {
                                 player.jump(toQueueIndex: player.index + 1 + offset)
                             } label: {

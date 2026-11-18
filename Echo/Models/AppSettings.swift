@@ -65,6 +65,8 @@ final class AppSettings: ObservableObject {
     @Published var waveMood: WaveMood { didSet { d.set(waveMood.rawValue, forKey: "waveMood") } }
     @Published var accent: AccentTheme { didSet { d.set(accent.rawValue, forKey: "accent") } }
     @Published var radioCountry: String { didSet { d.set(radioCountry, forKey: "radioCountry") } }
+    /// Подмешивать в «Мою волну» свежие треки из Audius
+    @Published var waveOnline: Bool { didSet { d.set(waveOnline, forKey: "waveOnline") } }
 
     init() {
         let d = UserDefaults.standard
@@ -79,6 +81,7 @@ final class AppSettings: ObservableObject {
         waveMood = WaveMood(rawValue: d.string(forKey: "waveMood") ?? "") ?? .mix
         accent = AccentTheme(rawValue: d.string(forKey: "accent") ?? "") ?? .echo
         radioCountry = d.string(forKey: "radioCountry") ?? "RU"
+        waveOnline = d.object(forKey: "waveOnline") as? Bool ?? true
     }
 
     func apply(_ preset: EQPreset) {

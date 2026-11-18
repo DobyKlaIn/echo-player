@@ -23,8 +23,28 @@ struct ArtworkView: View {
             Image(uiImage: img)
                 .resizable()
                 .scaledToFill()
+        } else if let id = trackID, let url = OnlineStore.shared.artworkURL(for: id, large: large) {
+            RemoteImage(url: url, seed: id, iconScale: large ? 0.3 : 0.4)
         } else {
             PlaceholderArt(seed: trackID ?? "echo", iconScale: large ? 0.3 : 0.4)
+        }
+    }
+}
+
+/// Картинка из интернета с заглушкой, пока грузится
+struct RemoteImage: View {
+    let url: URL
+    var seed: String
+    var icon = "music.note"
+    var iconScale: CGFloat = 0.4
+
+    var body: some View {
+        AsyncImage(url: url, transaction: Transaction(animation: .easeOut(duration: 0.2))) { phase in
+            if let image = phase.image {
+                image.resizable().scaledToFill()
+            } else {
+                PlaceholderArt(seed: seed, icon: icon, iconScale: iconScale)
+            }
         }
     }
 }
@@ -138,38 +158,54 @@ struct TrackMenuItems: View {
             Label("В конец очереди", systemImage: "text.append")
         }
         Divider()
-        Button { library.toggleLike(track.id) } label: {
+        Button { player.toggleLike(track.id) } label: {
             Label(track.liked ? "Убрать лайк" : "Нравится", systemImage: track.liked ? "heart.slash" : "heart")
         }
         Menu {
             Button {
+                if track.isOnline { OnlineStore.shared.remember(track.id) }
                 library.createPlaylist(name: "Плейлист \(library.playlists.count + 1)", trackIDs: [track.id])
                 library.toast = "Создан новый плейлист"
             } label: {
                 Label("Новый плейлист", systemImage: "plus")
             }
             ForEach(library.playlists) { p in
-                Button(p.name) { library.add(track.id, to: p.id) }
+                Button(p.name) {
+                    if track.isOnline { OnlineStore.shared.remember(track.id) }
+                    library.add(track.id, to: p.id)
+                }
             }
         } label: {
             Label("Добавить в плейлист", systemImage: "music.note.list")
         }
         Button {
-            library.toggleDislike(track.id)
+            if track.isOnline {
+                OnlineStore.shared.toggleDislike(track.id)
+            } else {
+                library.toggleDislike(track.id)
+            }
         } label: {
             Label(track.disliked ? "Вернуть в «Мою волну»" : "Не рекомендовать", systemImage: "hand.thumbsdown")
         }
-        if let onEdit = onEdit {
-            Button(action: onEdit) {
-                Label("Изменить название", systemImage: "pencil")
+        if track.isOnline {
+            if let url = OnlineStore.shared.onlineTrack(track.id)?.webURL {
+                Link(destination: url) {
+                    Label("Открыть в Audius", systemImage: "arrow.up.right.square")
+                }
             }
-        }
-        Divider()
-        Button(role: .destructive) {
-            player.trackDeleted(track.id)
-            library.deleteTrack(track.id)
-        } label: {
-            Label("Удалить с телефона", systemImage: "trash")
+        } else {
+            if let onEdit = onEdit {
+                Button(action: onEdit) {
+                    Label("Изменить название", systemImage: "pencil")
+                }
+            }
+            Divider()
+            Button(role: .destructive) {
+                player.trackDeleted(track.id)
+                library.deleteTrack(track.id)
+            } label: {
+                Label("Удалить с телефона", systemImage: "trash")
+            }
         }
     }
 }

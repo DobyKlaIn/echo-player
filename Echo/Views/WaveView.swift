@@ -24,7 +24,7 @@ struct WaveView: View {
                     if !library.recentlyAdded.isEmpty {
                         shelf(title: "Недавно добавленные", tracks: Array(library.recentlyAdded.prefix(20)))
                     }
-                    if library.tracks.isEmpty {
+                    if library.tracks.isEmpty && !settings.waveOnline {
                         EmptyStateView(icon: "music.note.house",
                                        title: "Добавь свою музыку",
                                        text: "Открой вкладку «Медиатека» и нажми «+», или поделись mp3 из Telegram → «Эхо». «Моя волна» начнёт подбирать треки под тебя.")
@@ -53,12 +53,18 @@ struct WaveView: View {
                         player.startWave()
                     }
                 } label: {
-                    Image(systemName: waveActive && player.isPlaying ? "pause.fill" : "play.fill")
-                        .font(.system(size: 34, weight: .bold))
-                        .foregroundStyle(settings.accent.onAccent)
-                        .frame(width: 84, height: 84)
-                        .background(Circle().fill(settings.accent.color))
-                        .shadow(color: settings.accent.color.opacity(0.6), radius: 24)
+                    ZStack {
+                        Circle().fill(settings.accent.color)
+                        if player.isPreparingWave || (waveActive && player.isBuffering) {
+                            ProgressView().tint(settings.accent.onAccent).scaleEffect(1.4)
+                        } else {
+                            Image(systemName: waveActive && player.isPlaying ? "pause.fill" : "play.fill")
+                                .font(.system(size: 34, weight: .bold))
+                                .foregroundStyle(settings.accent.onAccent)
+                        }
+                    }
+                    .frame(width: 84, height: 84)
+                    .shadow(color: settings.accent.color.opacity(0.6), radius: 24)
                 }
                 .buttonStyle(.plain)
                 Text("Моя волна")
@@ -107,6 +113,15 @@ struct WaveView: View {
                 }
                 .padding(.horizontal, 20)
             }
+            Toggle(isOn: $settings.waveOnline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Открытия из Audius").font(.subheadline.weight(.semibold))
+                    Text("Подмешивать в волну свежие онлайн-треки").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .tint(settings.accent.color)
+            .padding(.horizontal, 20)
+            .onChange(of: settings.waveOnline) { _ in player.waveMoodChanged() }
         }
     }
 

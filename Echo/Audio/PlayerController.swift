@@ -28,8 +28,12 @@ final class RadioMetadataReceiver: NSObject, AVPlayerItemMetadataOutputPushDeleg
     }
 }
 
-/// Мозг плеера: очередь, перемешивание, повтор, «Моя волна», радио,
-/// экран блокировки, таймер сна, учёт прослушиваний
+/// Мозг плеера: очередь, перемешивание, повтор, «Моя волна», онлайн-треки Audius,
+/// радио, экран блокировки, таймер сна, учёт прослушиваний.
+///
+/// Онлайн-трек начинает играть сразу потоком (AVPlayer), параллельно скачивается
+/// во временный кэш, а потом незаметно переключается на движок с эквалайзером.
+/// Следующие треки скачиваются заранее, поэтому для них работает и кроссфейд.
 final class PlayerController: ObservableObject {
     @Published private(set) var queue: [String] = []
     @Published private(set) var index: Int = 0
@@ -38,10 +42,12 @@ final class PlayerController: ObservableObject {
     @Published private(set) var shuffle = false
     @Published var repeatMode: RepeatMode = .off { didSet { saveState() } }
     @Published private(set) var isWave = false
+    @Published private(set) var isPreparingWave = false
     @Published private(set) var source: PlaybackSource = .none
     @Published private(set) var station: RadioStation?
     @Published private(set) var radioTitle: String?
     @Published private(set) var radioBuffering = false
+    @Published private(set) var isBuffering = false
     @Published private(set) var sleepEndDate: Date?
     @Published private(set) var sleepAtTrackEnd = false
     @Published var showNowPlaying = false
@@ -49,11 +55,22 @@ final class PlayerController: ObservableObject {
     let clock = PlaybackClock()
     let library: Library
     let settings: AppSettings
+    let online: OnlineStore
 
     private let engine = AudioEngine()
+
+    // радио
     private var radioPlayer: AVPlayer?
     private var radioReceiver: RadioMetadataReceiver?
     private var radioStatusObserver: NSKeyValueObservation?
+
+    // онлайн-поток (пока трек не скачался)
+    private var streamPlayer: AVPlayer?
+    private var streamingID: String?
+    private var streamEndObserver: NSObjectProtocol?
+    private var streamItemStatusObserver: NSKeyValueObservation?
+    private var streamControlObserver: NSKeyValueObservation?
+
     private var tickTimer: Timer?
     private var originalQueue: [String] = []
     private var lastTick: Date?
@@ -68,13 +85,15 @@ final class PlayerController: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
 
     var currentTrackID: String? { queue.indices.contains(index) ? queue[index] : nil }
-    var currentTrack: Track? { currentTrackID.flatMap { library.track($0) } }
+    var currentTrack: Track? { currentTrackID.flatMap { library.resolve($0) } }
     var hasContent: Bool { source == .radio ? station != nil : currentTrack != nil }
     var upcoming: [String] { index + 1 < queue.count ? Array(queue[(index + 1)...]) : [] }
+    var isCurrentOnline: Bool { currentTrackID.map(OnlineStore.isOnline) ?? false }
 
-    init(library: Library, settings: AppSettings) {
+    init(library: Library, settings: AppSettings, online: OnlineStore) {
         self.library = library
         self.settings = settings
+        self.online = online
 
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
 
@@ -119,11 +138,46 @@ final class PlayerController: ObservableObject {
         startCurrent()
     }
 
+    /// Пул треков для «Моей волны»: своя музыка, онлайн-лайки и открытия Audius
+    private func wavePool() -> [Track] {
+        var pool = library.tracks
+        let likedOnline = online.likedTracks
+        pool.append(contentsOf: likedOnline)
+        if settings.waveOnline {
+            let likedSet = Set(likedOnline.map(\.id))
+            pool.append(contentsOf: online.discoveryTracks.filter { !likedSet.contains($0.id) })
+        }
+        return pool
+    }
+
     func startWave() {
-        let ids = WaveGenerator.next(count: 6, from: library.tracks, mood: settings.waveMood,
+        let needDiscovery = settings.waveOnline && !online.discoveryIsFresh
+        if needDiscovery && (library.tracks.isEmpty || online.discoveryIDs.isEmpty) {
+            // без открытий волна пустая или слишком однообразная — сначала подгружаем
+            isPreparingWave = true
+            Task { [weak self] in
+                guard let strong = self else { return }
+                await strong.online.loadDiscovery()
+                await MainActor.run {
+                    strong.isPreparingWave = false
+                    strong.startWaveNow()
+                }
+            }
+            return
+        }
+        if needDiscovery {
+            Task { [weak self] in await self?.online.loadDiscovery() }
+        }
+        startWaveNow()
+    }
+
+    private func startWaveNow() {
+        let ids = WaveGenerator.next(count: 6, from: wavePool(), mood: settings.waveMood,
                                      recent: library.history.suffix(40).map(\.trackID))
         guard !ids.isEmpty else {
-            library.toast = "Сначала добавь музыку в медиатеку"
+            library.toast = settings.waveOnline
+                ? "Нет интернета, а своей музыки пока нет"
+                : "Сначала добавь музыку или включи открытия Audius"
             return
         }
         isWave = true
@@ -140,20 +194,25 @@ final class PlayerController: ObservableObject {
         guard isWave else { return }
         queue = Array(queue.prefix(index + 1))
         ensureWaveBuffer()
+        prefetchUpcoming()
     }
 
     private func ensureWaveBuffer() {
         guard isWave else { return }
         if queue.count - index <= 3 {
-            let more = WaveGenerator.next(count: 6, from: library.tracks, mood: settings.waveMood,
+            let more = WaveGenerator.next(count: 6, from: wavePool(), mood: settings.waveMood,
                                           recent: Array(queue.suffix(40)))
             queue.append(contentsOf: more)
             originalQueue = queue
+            if settings.waveOnline && !online.discoveryIsFresh {
+                Task { [weak self] in await self?.online.loadDiscovery() }
+            }
         }
     }
 
     private func startCurrent(at time: Double = 0, autoplay: Bool = true) {
         stopRadio()
+        stopStream()
         flushListening()
         guard let track = currentTrack else {
             engine.stop()
@@ -167,13 +226,28 @@ final class PlayerController: ObservableObject {
         playCounted = false
         if autoplay { activateSession() }
 
-        if engine.load(url: library.url(for: track), from: time, autoplay: autoplay) {
-            failures = 0
-            source = .local
-            duration = engine.duration > 0 ? engine.duration : track.duration
-            clock.time = time
-            isPlaying = autoplay
-            lastTick = Date()
+        if track.isOnline {
+            online.remember(track.id)
+            if let cached = online.cachedFile(for: track.id),
+               engine.load(url: cached, from: time, autoplay: autoplay) {
+                AudioDownloader.touch(cached)
+                didStartLocal(track: track, time: time, autoplay: autoplay)
+            } else {
+                // нет в кэше (или файл битый) — играем потоком, параллельно качаем
+                online.dropCachedFile(track.id)
+                engine.stop()
+                startStream(track, at: time, autoplay: autoplay)
+            }
+            let id = track.id
+            Task { [weak self] in
+                guard let strong = self else { return }
+                await strong.online.ensureArtwork(id)
+                await MainActor.run {
+                    if strong.currentTrackID == id { strong.updateNowPlaying() }
+                }
+            }
+        } else if engine.load(url: library.url(for: track), from: time, autoplay: autoplay) {
+            didStartLocal(track: track, time: time, autoplay: autoplay)
         } else {
             // файл повреждён или удалён — пропускаем
             failures += 1
@@ -187,8 +261,138 @@ final class PlayerController: ObservableObject {
             library.toast = "Не получается открыть «\(track.title)»"
         }
         ensureWaveBuffer()
+        prefetchUpcoming()
         updateNowPlaying()
         saveState()
+    }
+
+    private func didStartLocal(track: Track, time: Double, autoplay: Bool) {
+        failures = 0
+        source = .local
+        duration = engine.duration > 0 ? engine.duration : track.duration
+        clock.time = time
+        isPlaying = autoplay && engine.isPlaying
+        lastTick = Date()
+    }
+
+    // MARK: Онлайн-поток
+
+    private func startStream(_ track: Track, at time: Double, autoplay: Bool) {
+        guard let url = online.streamURL(for: track.id) else { return }
+        let item = AVPlayerItem(url: url)
+        let player = AVPlayer(playerItem: item)
+        player.automaticallyWaitsToMinimizeStalling = true
+        if time > 1 {
+            player.seek(to: CMTime(seconds: time, preferredTimescale: 600))
+        }
+        let id = track.id
+        streamEndObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
+            self?.streamEnded(id: id)
+        }
+        streamItemStatusObserver = item.observe(\.status, options: [.new]) { [weak self] it, _ in
+            let failed = it.status == .failed
+            DispatchQueue.main.async {
+                if failed { self?.streamFailed(id: id) }
+            }
+        }
+        streamControlObserver = player.observe(\.timeControlStatus, options: [.new]) { [weak self] p, _ in
+            let waiting = p.timeControlStatus == .waitingToPlayAtSpecifiedRate
+            DispatchQueue.main.async {
+                guard let self = self, self.streamingID == id else { return }
+                self.isBuffering = waiting
+            }
+        }
+        streamPlayer = player
+        streamingID = id
+        source = .local
+        duration = track.duration
+        clock.time = time
+        failures = 0
+        lastTick = Date()
+        if autoplay {
+            player.play()
+            isPlaying = true
+            isBuffering = true
+        } else {
+            isPlaying = false
+        }
+
+        // качаем файл и переключаемся на движок с эквалайзером
+        Task { [weak self] in
+            guard let strong = self else { return }
+            let file = await strong.online.download(id)
+            guard let file = file else { return }
+            await MainActor.run { strong.handoffToEngine(id: id, file: file) }
+        }
+    }
+
+    private func handoffToEngine(id: String, file: URL) {
+        guard streamingID == id, let sp = streamPlayer, currentTrackID == id else { return }
+        let t = sp.currentTime().seconds
+        guard t.isFinite else { return }
+        // перед самым концом не переключаемся — пусть доиграет потоком
+        if duration > 0, duration - t < 4 { return }
+        let playing = isPlaying
+        if engine.load(url: file, from: t + 0.05, autoplay: playing) {
+            stopStream()
+            duration = engine.duration > 0 ? engine.duration : duration
+            clock.time = t
+            isPlaying = playing && engine.isPlaying
+            crossfadeTriggered = false
+            updateNowPlaying()
+        } else {
+            online.dropCachedFile(id)
+        }
+    }
+
+    private func stopStream() {
+        if let obs = streamEndObserver { NotificationCenter.default.removeObserver(obs) }
+        streamEndObserver = nil
+        streamItemStatusObserver = nil
+        streamControlObserver = nil
+        streamPlayer?.pause()
+        streamPlayer = nil
+        streamingID = nil
+        isBuffering = false
+    }
+
+    private func streamEnded(id: String) {
+        guard streamingID == id else { return }
+        stopStream()
+        trackEnded()
+    }
+
+    private func streamFailed(id: String) {
+        guard streamingID == id else { return }
+        stopStream()
+        library.toast = "Трек не загрузился — проверь интернет"
+        failures += 1
+        if failures < 5, index + 1 < queue.count || isWave {
+            advance(auto: true)
+        } else {
+            isPlaying = false
+            updateNowPlaying()
+        }
+    }
+
+    /// Заранее скачиваем следующие онлайн-треки — переход будет мгновенным
+    private func prefetchUpcoming() {
+        let next = upcoming.prefix(2).filter { OnlineStore.isOnline($0) && online.cachedFile(for: $0) == nil }
+        for id in next {
+            Task { [weak self] in
+                guard let strong = self else { return }
+                _ = await strong.online.download(id)
+            }
+        }
+    }
+
+    private var playbackTime: Double {
+        if let sp = streamPlayer {
+            let s = sp.currentTime().seconds
+            return s.isFinite ? s : clock.time
+        }
+        return engine.currentTime
     }
 
     // MARK: Управление
@@ -201,13 +405,18 @@ final class PlayerController: ObservableObject {
             isPlaying = true
         case .local:
             activateSession()
-            engine.resume()
-            isPlaying = engine.isPlaying
+            if let sp = streamPlayer {
+                sp.play()
+                isPlaying = true
+            } else {
+                engine.resume()
+                isPlaying = engine.isPlaying
+            }
             lastTick = Date()
         case .none:
             if currentTrack != nil {
                 startCurrent()
-            } else if !library.tracks.isEmpty {
+            } else {
                 startWave()
             }
         }
@@ -218,8 +427,13 @@ final class PlayerController: ObservableObject {
         switch source {
         case .radio: radioPlayer?.pause()
         case .local:
-            engine.pause()
-            clock.time = engine.currentTime
+            if let sp = streamPlayer {
+                sp.pause()
+                clock.time = playbackTime
+            } else {
+                engine.pause()
+                clock.time = engine.currentTime
+            }
         case .none: break
         }
         isPlaying = false
@@ -235,7 +449,7 @@ final class PlayerController: ObservableObject {
     func next() {
         if source == .radio { return }
         if let id = currentTrackID, clock.time < 30, duration > 45 {
-            library.recordSkip(id)
+            recordSkip(id)
         }
         advance(auto: false)
     }
@@ -254,7 +468,11 @@ final class PlayerController: ObservableObject {
     func seek(to t: Double) {
         guard source == .local else { return }
         let target = min(max(0, t), max(0, duration - 0.3))
-        engine.seek(to: target)
+        if let sp = streamPlayer {
+            sp.seek(to: CMTime(seconds: target, preferredTimescale: 600))
+        } else {
+            engine.seek(to: target)
+        }
         clock.time = target
         crossfadeTriggered = false
         updateNowPlaying()
@@ -286,19 +504,34 @@ final class PlayerController: ObservableObject {
             startCurrent(at: 0, autoplay: false)
             return
         }
-        if crossfade, let track = currentTrack {
-            flushListening()
-            if engine.crossfade(to: library.url(for: track), duration: settings.crossfade) {
-                source = .local
-                duration = engine.duration > 0 ? engine.duration : track.duration
-                clock.time = 0
-                listenedThisTrack = 0
-                playCounted = false
-                isPlaying = true
-                ensureWaveBuffer()
-                updateNowPlaying()
-                saveState()
-                return
+        if crossfade, streamPlayer == nil, let track = currentTrack {
+            let fileURL: URL? = track.isOnline ? online.cachedFile(for: track.id) : library.url(for: track)
+            if let url = fileURL {
+                flushListening()
+                if engine.crossfade(to: url, duration: settings.crossfade) {
+                    if track.isOnline { online.remember(track.id) }
+                    source = .local
+                    duration = engine.duration > 0 ? engine.duration : track.duration
+                    clock.time = 0
+                    listenedThisTrack = 0
+                    playCounted = false
+                    isPlaying = true
+                    ensureWaveBuffer()
+                    prefetchUpcoming()
+                    updateNowPlaying()
+                    saveState()
+                    if track.isOnline {
+                        let id = track.id
+                        Task { [weak self] in
+                            guard let strong = self else { return }
+                            await strong.online.ensureArtwork(id)
+                            await MainActor.run {
+                                if strong.currentTrackID == id { strong.updateNowPlaying() }
+                            }
+                        }
+                    }
+                    return
+                }
             }
         }
         startCurrent()
@@ -306,7 +539,7 @@ final class PlayerController: ObservableObject {
 
     private func trackEnded() {
         if !playCounted, let id = currentTrackID {
-            library.recordPlay(id)
+            recordPlay(id)
             playCounted = true
         }
         if sleepAtTrackEnd {
@@ -320,6 +553,23 @@ final class PlayerController: ObservableObject {
         advance(auto: true)
     }
 
+    // MARK: Статистика (своя музыка и онлайн)
+
+    private func recordPlay(_ id: String) {
+        if OnlineStore.isOnline(id) {
+            online.recordPlay(id)
+        }
+        library.recordPlay(id)
+    }
+
+    private func recordSkip(_ id: String) {
+        if OnlineStore.isOnline(id) {
+            online.recordSkip(id)
+        } else {
+            library.recordSkip(id)
+        }
+    }
+
     // MARK: Очередь
 
     func playNext(_ id: String) {
@@ -330,6 +580,7 @@ final class PlayerController: ObservableObject {
         queue.insert(id, at: min(index + 1, queue.count))
         originalQueue.append(id)
         library.toast = "Сыграет следующим"
+        prefetchUpcoming()
         saveState()
     }
 
@@ -345,6 +596,7 @@ final class PlayerController: ObservableObject {
         }
         originalQueue.append(id)
         library.toast = "Добавлено в очередь"
+        prefetchUpcoming()
         saveState()
     }
 
@@ -352,6 +604,7 @@ final class PlayerController: ObservableObject {
         var up = upcoming
         up.moveItems(fromOffsets: source, toOffset: destination)
         queue = Array(queue.prefix(index + 1)) + up
+        prefetchUpcoming()
         saveState()
     }
 
@@ -383,6 +636,7 @@ final class PlayerController: ObservableObject {
             queue = originalQueue
             index = i
         }
+        prefetchUpcoming()
         saveState()
     }
 
@@ -399,6 +653,7 @@ final class PlayerController: ObservableObject {
         if wasCurrent {
             if queue.isEmpty {
                 engine.stop()
+                stopStream()
                 source = .none
                 isPlaying = false
                 updateNowPlaying()
@@ -412,15 +667,33 @@ final class PlayerController: ObservableObject {
 
     // MARK: Лайки
 
+    func isLiked(_ id: String) -> Bool {
+        library.resolve(id)?.liked ?? false
+    }
+
+    func toggleLike(_ id: String) {
+        if OnlineStore.isOnline(id) {
+            online.toggleLike(id)
+            objectWillChange.send()
+        } else {
+            library.toggleLike(id)
+        }
+    }
+
     func toggleLikeCurrent() {
         guard let id = currentTrackID else { return }
-        library.toggleLike(id)
+        toggleLike(id)
     }
 
     func dislikeCurrent() {
         guard let id = currentTrackID else { return }
-        library.toggleDislike(id)
-        if library.track(id)?.disliked == true {
+        if OnlineStore.isOnline(id) {
+            online.toggleDislike(id)
+            objectWillChange.send()
+        } else {
+            library.toggleDislike(id)
+        }
+        if library.resolve(id)?.disliked == true {
             library.toast = "Больше не будет в «Моей волне»"
             next()
         }
@@ -430,7 +703,10 @@ final class PlayerController: ObservableObject {
 
     func playStation(_ s: RadioStation) {
         guard let url = URL(string: s.url) else { return }
-        if source == .local { engine.pause() }
+        if source == .local {
+            engine.pause()
+            streamPlayer?.pause()
+        }
         flushListening()
         stopRadio()
         activateSession()
@@ -449,8 +725,9 @@ final class PlayerController: ObservableObject {
         let player = AVPlayer(playerItem: item)
         player.automaticallyWaitsToMinimizeStalling = true
         radioStatusObserver = player.observe(\.timeControlStatus, options: [.new]) { [weak self] p, _ in
+            let waiting = p.timeControlStatus == .waitingToPlayAtSpecifiedRate
             DispatchQueue.main.async {
-                self?.radioBuffering = p.timeControlStatus == .waitingToPlayAtSpecifiedRate
+                self?.radioBuffering = waiting
             }
         }
         player.play()
@@ -511,12 +788,12 @@ final class PlayerController: ObservableObject {
             return
         }
 
-        guard source == .local, engine.hasFile else { return }
-        let t = engine.currentTime
+        guard source == .local, streamPlayer != nil || engine.hasFile else { return }
+        let t = playbackTime
         if abs(clock.time - t) > 0.05 { clock.time = t }
 
         let now = Date()
-        if isPlaying, let last = lastTick {
+        if isPlaying, !isBuffering, let last = lastTick {
             let dt = now.timeIntervalSince(last)
             if dt > 0, dt < 2 {
                 listenedThisTrack += dt
@@ -528,20 +805,20 @@ final class PlayerController: ObservableObject {
         if isPlaying, !playCounted, let id = currentTrackID,
            listenedThisTrack >= 30 || (duration > 0 && listenedThisTrack >= duration * 0.5) {
             playCounted = true
-            library.recordPlay(id)
+            recordPlay(id)
         }
 
         if pendingListen >= 30 { flushListening() }
         if tickCount % 20 == 0 { saveTimeOnly() }
 
-        // плавный переход к следующему треку
+        // плавный переход к следующему треку (только когда играет движок)
         let cf = settings.crossfade
         let hasNext = isWave || index + 1 < queue.count || repeatMode == .all
-        if isPlaying, cf > 0, !crossfadeTriggered, repeatMode != .one, hasNext,
+        if streamPlayer == nil, isPlaying, cf > 0, !crossfadeTriggered, repeatMode != .one, hasNext,
            duration > cf * 2 + 5, duration - t <= cf, !sleepAtTrackEnd {
             crossfadeTriggered = true
             if !playCounted, let id = currentTrackID {
-                library.recordPlay(id)
+                recordPlay(id)
                 playCounted = true
             }
             advance(auto: true, crossfade: true)
@@ -584,6 +861,7 @@ final class PlayerController: ObservableObject {
         flushListening()
         saveState()
         library.saveNow()
+        online.saveNow()
     }
 
     private func handleInterruption(_ note: Notification) {
@@ -664,7 +942,7 @@ final class PlayerController: ObservableObject {
             info[MPMediaItemPropertyArtist] = t.displayArtist
             if !t.album.isEmpty { info[MPMediaItemPropertyAlbumTitle] = t.album }
             info[MPMediaItemPropertyPlaybackDuration] = duration
-            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = engine.currentTime
+            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = playbackTime
             info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
             if let img = ArtworkCache.shared.image(for: t.id) {
                 info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: img.size) { _ in img }
@@ -710,18 +988,23 @@ final class PlayerController: ObservableObject {
         let savedRepeat = RepeatMode(rawValue: d.integer(forKey: "state.repeat")) ?? .off
 
         let currentID = saved.indices.contains(savedIndex) ? saved[savedIndex] : nil
-        let valid = saved.filter { library.track($0) != nil }
+        let valid = saved.filter { library.resolve($0) != nil }
         if !valid.isEmpty {
             queue = valid
-            let orig = savedOriginal.filter { library.track($0) != nil }
+            let orig = savedOriginal.filter { library.resolve($0) != nil }
             originalQueue = orig.isEmpty ? valid : orig
             index = currentID.flatMap { valid.firstIndex(of: $0) } ?? 0
             isWave = savedWave
             shuffle = savedShuffle
         }
         repeatMode = savedRepeat
-        if !valid.isEmpty {
+        if let cur = currentTrack, !cur.isOnline || online.cachedFile(for: cur.id) != nil {
             startCurrent(at: savedTime, autoplay: false)
+        } else if currentTrack != nil {
+            // онлайн-трек без кэша — не грузим сеть при запуске, начнём по кнопке
+            source = .none
+            duration = currentTrack?.duration ?? 0
+            clock.time = 0
         }
     }
 }

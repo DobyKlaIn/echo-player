@@ -118,8 +118,14 @@ final class Library: ObservableObject {
         return tracks[i]
     }
 
+    /// Трек из медиатеки или онлайн (Audius)
+    func resolve(_ id: String) -> Track? {
+        if let t = track(id) { return t }
+        return OnlineStore.isOnline(id) ? OnlineStore.shared.track(id) : nil
+    }
+
     func tracks(for ids: [String]) -> [Track] {
-        ids.compactMap { track($0) }
+        ids.compactMap { resolve($0) }
     }
 
     func url(for track: Track) -> URL {
@@ -453,6 +459,7 @@ final class Library: ObservableObject {
         }
         history.append(HistoryEntry(trackID: id, date: Date()))
         if history.count > 600 { history.removeFirst(history.count - 600) }
+        scheduleSave()
     }
 
     func recordSkip(_ id: String) {
@@ -570,7 +577,7 @@ final class Library: ObservableObject {
         for entry in history.reversed() {
             if seen.contains(entry.trackID) { continue }
             seen.insert(entry.trackID)
-            if let t = track(entry.trackID) { result.append(t) }
+            if let t = resolve(entry.trackID) { result.append(t) }
             if result.count >= 20 { break }
         }
         return result

@@ -12,6 +12,7 @@ struct NowPlayingView: View {
     @EnvironmentObject var library: Library
     @EnvironmentObject var settings: AppSettings
     @EnvironmentObject var radio: RadioStore
+    @EnvironmentObject var online: OnlineStore
     @Environment(\.dismiss) private var dismiss
     @State private var bg: Color = Color(white: 0.2)
     @State private var panel: PlayerPanel? = nil
@@ -39,6 +40,7 @@ struct NowPlayingView: View {
                 .environmentObject(player)
                 .environmentObject(library)
                 .environmentObject(settings)
+                .environmentObject(online)
                 .tint(settings.accent.color)
                 .preferredColorScheme(.dark)
         }
@@ -49,7 +51,7 @@ struct NowPlayingView: View {
 
     private func trackContent(_ track: Track) -> some View {
         VStack(spacing: 0) {
-            header(title: player.isWave ? "Моя волна" : "Сейчас играет")
+            header(title: player.isWave ? "Моя волна" : (track.isOnline ? "Audius · онлайн" : "Сейчас играет"))
             Spacer(minLength: 12)
             ArtworkView(trackID: track.id, corner: 18, large: true)
                 .shadow(color: .black.opacity(0.5), radius: 30, y: 16)
@@ -156,11 +158,17 @@ struct NowPlayingView: View {
             }
             Spacer()
             Button { player.togglePlay() } label: {
-                Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
-                    .font(.system(size: 32, weight: .bold))
-                    .foregroundStyle(.black)
-                    .frame(width: 78, height: 78)
-                    .background(Circle().fill(Color.white))
+                ZStack {
+                    Circle().fill(Color.white)
+                    if player.isBuffering {
+                        ProgressView().tint(.black).scaleEffect(1.3)
+                    } else {
+                        Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
+                            .font(.system(size: 32, weight: .bold))
+                            .foregroundStyle(.black)
+                    }
+                }
+                .frame(width: 78, height: 78)
             }
             Spacer()
             Button { player.next() } label: {
@@ -268,6 +276,9 @@ struct NowPlayingView: View {
     private func updateBackground() async {
         var image: UIImage?
         if player.source == .local, let id = player.currentTrackID {
+            if OnlineStore.isOnline(id) {
+                await online.ensureArtwork(id)
+            }
             image = ArtworkCache.shared.image(for: id)
         }
         let color: UIColor

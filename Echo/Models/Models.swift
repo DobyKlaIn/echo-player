@@ -23,6 +23,8 @@ struct Track: Identifiable, Hashable {
     var displayArtist: String { artist.isEmpty ? "Неизвестный исполнитель" : artist }
     var displayAlbum: String { album.isEmpty ? "Без альбома" : album }
     var albumKey: String { "\(displayArtist.lowercased())|\(displayAlbum.lowercased())" }
+    /// Онлайн-трек из Audius (не хранится в медиатеке)
+    var isOnline: Bool { id.hasPrefix("audius-") }
 }
 
 extension Track: Codable {

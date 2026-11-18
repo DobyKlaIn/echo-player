@@ -5,6 +5,7 @@ struct SettingsView: View {
     @EnvironmentObject var library: Library
     @EnvironmentObject var player: PlayerController
     @State private var storage: Int64 = 0
+    @State private var onlineCache: Int64 = 0
     @State private var showHelp = false
 
     private let countries: [(code: String, name: String)] = [
@@ -49,6 +50,9 @@ struct SettingsView: View {
                         Label("Характер", systemImage: "waveform")
                     }
                     .onChange(of: settings.waveMood) { _ in player.waveMoodChanged() }
+                    Toggle(isOn: $settings.waveOnline) {
+                        Label("Открытия из Audius", systemImage: "globe")
+                    }
                     Text("Волна учится на тебе: лайк — чаще, дизлайк — никогда, пропуск в первые 30 секунд — реже.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
@@ -101,6 +105,24 @@ struct SettingsView: View {
 
                 Section {
                     HStack {
+                        Label("Кэш онлайн-треков", systemImage: "icloud.and.arrow.down")
+                        Spacer()
+                        Text(ByteCountFormatter.string(fromByteCount: onlineCache, countStyle: .file)).foregroundStyle(.secondary)
+                    }
+                    Button(role: .destructive) {
+                        AudioDownloader.clearCache()
+                        onlineCache = 0
+                    } label: {
+                        Label("Очистить кэш", systemImage: "trash")
+                    }
+                } header: {
+                    Text("Онлайн (Audius)")
+                } footer: {
+                    Text("Онлайн-треки временно сохраняются, чтобы играть без задержек и с эквалайзером. Кэш занимает не больше 700 МБ и чистится сам.")
+                }
+
+                Section {
+                    HStack {
                         Text("Версия")
                         Spacer()
                         Text(appVersion).foregroundStyle(.secondary)
@@ -115,6 +137,7 @@ struct SettingsView: View {
                     Self.musicFolderSize()
                 }.value
                 storage = bytes
+                onlineCache = await Task.detached { AudioDownloader.cacheSize() }.value
             }
             .sheet(isPresented: $showHelp) { ImportHelpView() }
         }

@@ -5,12 +5,16 @@ struct RootView: View {
     @EnvironmentObject var library: Library
     @EnvironmentObject var settings: AppSettings
     @EnvironmentObject var radio: RadioStore
+    @EnvironmentObject var online: OnlineStore
 
     var body: some View {
         TabView {
             WaveView()
                 .withMiniPlayer()
                 .tabItem { Label("Волна", systemImage: "waveform") }
+            OnlineView()
+                .withMiniPlayer()
+                .tabItem { Label("Онлайн", systemImage: "globe") }
             LibraryView()
                 .withMiniPlayer()
                 .tabItem { Label("Медиатека", systemImage: "square.stack.fill") }
@@ -27,6 +31,7 @@ struct RootView: View {
                 .environmentObject(library)
                 .environmentObject(settings)
                 .environmentObject(radio)
+                .environmentObject(online)
                 .tint(settings.accent.color)
                 .preferredColorScheme(.dark)
         }
@@ -56,6 +61,7 @@ extension View {
 struct MiniPlayerView: View {
     @EnvironmentObject var player: PlayerController
     @EnvironmentObject var library: Library
+    @EnvironmentObject var online: OnlineStore
 
     var body: some View {
         if player.hasContent {
@@ -73,21 +79,28 @@ struct MiniPlayerView: View {
                     }
                     Spacer(minLength: 4)
                     if player.source == .local, let id = player.currentTrackID {
+                        let liked = player.isLiked(id)
                         Button {
-                            library.toggleLike(id)
+                            player.toggleLike(id)
                         } label: {
-                            Image(systemName: library.track(id)?.liked == true ? "heart.fill" : "heart")
+                            Image(systemName: liked ? "heart.fill" : "heart")
                                 .font(.title3)
-                                .foregroundStyle(library.track(id)?.liked == true ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
+                                .foregroundStyle(liked ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
                                 .frame(width: 36, height: 36)
                         }
                     }
                     Button {
                         player.togglePlay()
                     } label: {
-                        Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
-                            .font(.title2)
-                            .frame(width: 36, height: 36)
+                        ZStack {
+                            if player.isBuffering || player.radioBuffering {
+                                ProgressView()
+                            } else {
+                                Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
+                                    .font(.title2)
+                            }
+                        }
+                        .frame(width: 36, height: 36)
                     }
                     if player.source == .local {
                         Button {
@@ -139,6 +152,7 @@ struct MiniPlayerView: View {
     private var subtitle: String {
         if player.source == .radio { return player.station?.name ?? "" }
         if player.isWave { return "Моя волна · " + (player.currentTrack?.displayArtist ?? "") }
+        if player.isCurrentOnline { return "Audius · " + (player.currentTrack?.displayArtist ?? "") }
         return player.currentTrack?.displayArtist ?? ""
     }
 }
