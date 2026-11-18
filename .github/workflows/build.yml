@@ -1,0 +1,97 @@
+name: Сборка .ipa
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Версия Xcode
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Установка XcodeGen
+        run: brew install xcodegen
+
+      - name: Генерация проекта
+        run: xcodegen generate
+
+      - name: Сборка
+        run: |
+          set +e
+          xcodebuild \
+            -project Echo.xcodeproj \
+            -scheme Echo \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build > build.log 2>&1
+          STATUS=$?
+          grep -E "error:|fatal error" build.log | sort -u > errors.txt || true
+          grep -E "warning:" build.log | sort -u | head -200 > warnings.txt || true
+          tail -n 120 build.log > tail.txt
+          echo "---- ошибки ----"
+          cat errors.txt
+          echo "---- конец лога ----"
+          cat tail.txt
+          exit $STATUS
+
+      - name: Упаковка .ipa
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          echo "Приложение: $APP"
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry Echo.ipa Payload
+          ls -lh Echo.ipa
+
+      - name: Публикация релиза
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="build-${{ github.run_number }}"
+          MSG=$(git log -1 --pretty=%s)
+          gh release create "$TAG" Echo.ipa \
+            --title "Эхо — сборка ${{ github.run_number }}" \
+            --notes "$MSG
+
+          Скачать последнюю версию всегда можно по ссылке:
+          https://github.com/${{ github.repository }}/releases/latest/download/Echo.ipa" \
+            --latest
+          # оставляем только 5 последних сборок
+          gh release list --limit 100 --json tagName -q '.[].tagName' | tail -n +6 | while read t; do
+            gh release delete "$t" --yes --cleanup-tag || true
+          done
+
+      - name: Сохранение лога сборки
+        if: always()
+        run: |
+          mkdir -p /tmp/ci-logs
+          cp errors.txt warnings.txt tail.txt /tmp/ci-logs/ 2>/dev/null || true
+          echo "${{ job.status }} run=${{ github.run_number }} sha=${{ github.sha }}" > /tmp/ci-logs/status.txt
+          git config user.name "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          git checkout --orphan ci-logs
+          git rm -rfq . || true
+          git clean -fdxq
+          cp /tmp/ci-logs/* .
+          git add -A
+          git commit -qm "Лог сборки ${{ github.run_number }}"
+          git push -f origin ci-logs
