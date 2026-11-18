@@ -126,7 +126,7 @@ struct SettingsView: View {
         return "\(v) (\(b))"
     }
 
-    private static func musicFolderSize() -> Int64 {
+    nonisolated private static func musicFolderSize() -> Int64 {
         let fm = FileManager.default
         let root = Library.musicDir
         guard let subs = fm.subpaths(atPath: root.path) else { return 0 }
