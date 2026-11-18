@@ -93,10 +93,22 @@ final class AudioEngine {
         }
     }
 
+    /// Запускает плеер только если движок реально работает — иначе AVFoundation падает
+    @discardableResult
+    private func startNode(_ node: AVAudioPlayerNode) -> Bool {
+        ensureRunning()
+        guard engine.isRunning else {
+            isPlaying = false
+            return false
+        }
+        node.play()
+        return true
+    }
+
     /// Загружает файл в активный плеер и (по желанию) запускает
     @discardableResult
     func load(url: URL, from time: Double = 0, autoplay: Bool = true) -> Bool {
-        guard let file = try? AVAudioFile(forReading: url) else { return false }
+        guard let file = try? AVAudioFile(forReading: url), file.length > 0 else { return false }
         cancelFade()
         for i in 0..<2 {
             tokens[i] += 1
@@ -112,9 +124,7 @@ final class AudioEngine {
         lastKnownTime = max(0, time)
         schedule(slot: slot, from: lastKnownTime)
         if autoplay {
-            ensureRunning()
-            node.play()
-            isPlaying = true
+            isPlaying = startNode(node)
         } else {
             isPlaying = false
         }
@@ -165,8 +175,7 @@ final class AudioEngine {
             nodes[active].stop()
             schedule(slot: active, from: t)
         }
-        nodes[active].play()
-        isPlaying = true
+        isPlaying = startNode(nodes[active])
     }
 
     func seek(to time: Double) {
@@ -179,8 +188,7 @@ final class AudioEngine {
         lastKnownTime = min(max(0, time), duration)
         schedule(slot: active, from: lastKnownTime)
         if wasPlaying {
-            ensureRunning()
-            node.play()
+            isPlaying = startNode(node)
         }
     }
 
@@ -200,7 +208,8 @@ final class AudioEngine {
     /// Плавно переходит на следующий файл: новый трек нарастает, старый затихает
     @discardableResult
     func crossfade(to url: URL, duration fade: Double) -> Bool {
-        guard let file = try? AVAudioFile(forReading: url) else { return false }
+        guard let file = try? AVAudioFile(forReading: url), file.length > 0 else { return false }
+        guard engine.isRunning else { return false }
         finishFadeNow()
         let old = active
         let new = 1 - active
@@ -211,8 +220,7 @@ final class AudioEngine {
         files[new] = file
         schedule(slot: new, from: 0)
         nodes[new].volume = 0
-        ensureRunning()
-        nodes[new].play()
+        guard startNode(nodes[new]) else { return false }
         active = new
         lastKnownTime = 0
         isPlaying = true
@@ -269,8 +277,7 @@ final class AudioEngine {
         nodes[active].stop()
         schedule(slot: active, from: t)
         if wasPlaying {
-            ensureRunning()
-            nodes[active].play()
+            isPlaying = startNode(nodes[active])
         }
     }
 }
